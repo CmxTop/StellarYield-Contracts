@@ -201,3 +201,11 @@ pub fn emit_funding_target_set(e: &Env, target: i128) {
         target,
     );
 }
+
+/// Emitted by `set_blacklisted`.
+pub fn emit_address_blacklisted(e: &Env, address: Address, status: bool) {
+    e.events().publish(
+        (symbol_short!("blacklist"), address),
+        status,
+    );
+}

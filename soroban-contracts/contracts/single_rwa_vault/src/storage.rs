@@ -66,6 +66,7 @@ pub enum DataKey {
     // --- Vault state ---
     VaultState,
     Paused,
+    Locked,
     ActivationTimestamp,
     /// Reentrancy lock — true while a guarded function is executing.
     Locked,

@@ -1,0 +1,293 @@
+extern crate std;
+
+use soroban_sdk::{
+    testutils::Address as _,
+    token::StellarAssetClient,
+    Address, Env, String,
+};
+
+use crate::{InitParams, SingleRWAVault, SingleRWAVaultClient};
+use crate::storage::{
+    get_has_snapshot_for_epoch, get_share_balance, get_total_supply, get_user_shares_at_epoch,
+    put_current_epoch, put_epoch_total_shares, put_epoch_yield, put_share_balance, put_total_supply,
+};
+
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
+fn default_params(env: &Env, admin: &Address, asset: &Address) -> InitParams {
+    InitParams {
+        asset: asset.clone(),
+        share_name: String::from_str(env, "Vault Share"),
+        share_symbol: String::from_str(env, "VS"),
+        share_decimals: 7,
+        admin: admin.clone(),
+        zkme_verifier: admin.clone(),
+        cooperator: admin.clone(),
+        funding_target: 1_000_000_0000000_i128,
+        maturity_date: 9_999_999_999_u64,
+        min_deposit: 1_000_i128,
+        max_deposit_per_user: 0_i128,
+        early_redemption_fee_bps: 100_u32,
+        rwa_name: String::from_str(env, "Test RWA"),
+        rwa_symbol: String::from_str(env, "TRWA"),
+        rwa_document_uri: String::from_str(env, "https://test.com"),
+        rwa_category: String::from_str(env, "Real Estate"),
+        expected_apy: 500_u32,
+    }
+}
+
+/// Standard setup: global auth mock for convenience.
+/// Use for tests that do **not** need to verify emitted events.
+fn setup() -> (Env, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let admin = Address::generate(&env);
+    let asset_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let vault_id = env.register(SingleRWAVault, (default_params(&env, &admin, &asset_id),));
+
+    // Redirect zkme_verifier to the vault itself → is_kyc_verified always true.
+    SingleRWAVaultClient::new(&env, &vault_id).set_zkme_verifier(&admin, &vault_id);
+
+    (env, vault_id, asset_id, admin)
+}
+
+/// Directly credit `amount` vault-shares to `user` via contract storage,
+/// bypassing the deposit flow (no asset transfer, no KYC, no min-deposit).
+fn give_shares(env: &Env, vault_id: &Address, user: &Address, amount: i128) {
+    env.as_contract(vault_id, || {
+        let bal = get_share_balance(env, user);
+        put_share_balance(env, user, bal + amount);
+        let sup = get_total_supply(env);
+        put_total_supply(env, sup + amount);
+    });
+}
+
+/// Advance the vault's epoch counter and store per-epoch accounting data
+/// directly in contract storage (bypasses the Active-state guard).
+fn advance_epoch(env: &Env, vault_id: &Address, epoch: u32, yield_amount: i128, total_shares: i128) {
+    env.as_contract(vault_id, || {
+        put_current_epoch(env, epoch);
+        put_epoch_yield(env, epoch, yield_amount);
+        put_epoch_total_shares(env, epoch, total_shares);
+    });
+}
+
+// ─── Metadata ─────────────────────────────────────────────────────────────────
+
+/// decimals / name / symbol all round-trip through the InitParams.
+#[test]
+fn test_decimals_name_symbol() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+
+    assert_eq!(client.decimals(), 7);
+    assert_eq!(client.name(), String::from_str(&env, "Vault Share"));
+    assert_eq!(client.symbol(), String::from_str(&env, "VS"));
+}
+
+// ─── Balance ──────────────────────────────────────────────────────────────────
+
+/// balance() returns 0 for an address that has never held shares.
+#[test]
+fn test_balance_uninitialized_is_zero() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let stranger = Address::generate(&env);
+
+    assert_eq!(client.balance(&stranger), 0_i128);
+}
+
+/// Depositing underlying assets through the normal flow returns the correct
+/// share count (1:1 at an empty vault) and balance() agrees.
+#[test]
+fn test_balance_after_deposit() {
+    let (env, vault_id, asset_id, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &asset_id).mint(&alice, &10_000_i128);
+
+    let shares = client.deposit(&alice, &1_000_i128, &alice);
+
+    // First deposit: supply == 0, so preview_deposit returns assets 1:1.
+    assert_eq!(shares, 1_000_i128);
+    assert_eq!(client.balance(&alice), 1_000_i128);
+}
+
+/// total_supply mirrors the net of all mints and burns.
+#[test]
+fn test_total_supply_tracks_mints_and_burns() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+
+    give_shares(&env, &vault_id, &alice, 500_i128);
+    assert_eq!(client.total_supply(), 500_i128);
+
+    client.burn(&alice, &200_i128);
+    assert_eq!(client.balance(&alice), 300_i128);
+    assert_eq!(client.total_supply(), 300_i128);
+}
+
+// ─── Transfer ─────────────────────────────────────────────────────────────────
+
+/// transfer panics when the sender holds fewer shares than the requested amount.
+#[test]
+#[should_panic]
+fn test_transfer_panics_on_insufficient_balance() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    give_shares(&env, &vault_id, &alice, 100_i128);
+    client.transfer(&alice, &bob, &200_i128); // more than alice holds
+}
+
+/// transfer calls update_user_snapshot for both parties *before* adjusting
+/// balances, so each snapshot records the pre-transfer share count.
+#[test]
+fn test_transfer_updates_snapshots() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+
+    give_shares(&env, &vault_id, &alice, 1_000_i128);
+    // Advance to epoch 1 — mimics what distribute_yield would record.
+    advance_epoch(&env, &vault_id, 1, 100_i128, 1_000_i128);
+
+    client.transfer(&alice, &bob, &400_i128);
+
+    // Snapshots are written with balances as of the START of epoch 1.
+    env.as_contract(&vault_id, || {
+        assert!(get_has_snapshot_for_epoch(&env, &alice, 1));
+        assert_eq!(get_user_shares_at_epoch(&env, &alice, 1), 1_000_i128);
+
+        assert!(get_has_snapshot_for_epoch(&env, &bob, 1));
+        assert_eq!(get_user_shares_at_epoch(&env, &bob, 1), 0_i128);
+    });
+
+    assert_eq!(client.balance(&alice), 600_i128);
+    assert_eq!(client.balance(&bob), 400_i128);
+}
+
+// ─── Allowance & transfer_from ────────────────────────────────────────────────
+
+/// approve stores the allowance; a second approve overwrites it.
+#[test]
+fn test_approve_updates_allowance() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    let expiry = env.ledger().sequence() + 1_000_u32;
+    client.approve(&alice, &spender, &500_i128, &expiry);
+    assert_eq!(client.allowance(&alice, &spender), 500_i128);
+
+    // Overwrite with a lower amount.
+    client.approve(&alice, &spender, &150_i128, &expiry);
+    assert_eq!(client.allowance(&alice, &spender), 150_i128);
+}
+
+/// transfer_from moves shares and decrements the spender's allowance
+/// by exactly the transferred amount.
+#[test]
+fn test_transfer_from_spends_allowance() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    give_shares(&env, &vault_id, &alice, 1_000_i128);
+
+    let expiry = env.ledger().sequence() + 1_000_u32;
+    client.approve(&alice, &spender, &600_i128, &expiry);
+    client.transfer_from(&spender, &alice, &bob, &400_i128);
+
+    assert_eq!(client.allowance(&alice, &spender), 200_i128); // 600 − 400
+    assert_eq!(client.balance(&alice), 600_i128);
+    assert_eq!(client.balance(&bob), 400_i128);
+}
+
+/// transfer_from panics when the spender has no allowance.
+#[test]
+#[should_panic]
+fn test_transfer_from_insufficient_allowance_panics() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    give_shares(&env, &vault_id, &alice, 1_000_i128);
+    // No approve — allowance is 0.
+    client.transfer_from(&spender, &alice, &bob, &100_i128);
+}
+
+// ─── Burn ─────────────────────────────────────────────────────────────────────
+
+/// burn reduces both balance and total_supply.
+#[test]
+fn test_burn_reduces_balance_and_supply() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+
+    give_shares(&env, &vault_id, &alice, 800_i128);
+    client.burn(&alice, &300_i128);
+
+    assert_eq!(client.balance(&alice), 500_i128);
+    assert_eq!(client.total_supply(), 500_i128);
+}
+
+/// burn_from decrements the spender's allowance and removes shares from
+/// the owner, updating both balance and total_supply.
+#[test]
+fn test_burn_from_spends_allowance() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    give_shares(&env, &vault_id, &alice, 1_000_i128);
+
+    let expiry = env.ledger().sequence() + 1_000_u32;
+    client.approve(&alice, &spender, &400_i128, &expiry);
+    client.burn_from(&spender, &alice, &250_i128);
+
+    assert_eq!(client.allowance(&alice, &spender), 150_i128); // 400 − 250
+    assert_eq!(client.balance(&alice), 750_i128);
+    assert_eq!(client.total_supply(), 750_i128);
+}
+
+/// burn_from panics when the spender's allowance is insufficient.
+#[test]
+#[should_panic]
+fn test_burn_from_insufficient_allowance_panics() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+    let spender = Address::generate(&env);
+
+    give_shares(&env, &vault_id, &alice, 1_000_i128);
+    // No approve — allowance is 0.
+    client.burn_from(&spender, &alice, &100_i128);
+}
+
+/// burn panics when the holder's balance is insufficient.
+#[test]
+#[should_panic]
+fn test_burn_insufficient_balance_panics() {
+    let (env, vault_id, _, _) = setup();
+    let client = SingleRWAVaultClient::new(&env, &vault_id);
+    let alice = Address::generate(&env);
+
+    give_shares(&env, &vault_id, &alice, 100_i128);
+    client.burn(&alice, &200_i128); // more than alice holds
+}
