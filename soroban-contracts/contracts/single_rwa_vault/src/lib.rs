@@ -1693,6 +1693,7 @@ mod tests;
 mod test_close_vault;
 #[cfg(test)]
 mod test_constructor_validation;
-mod test_token;
 #[cfg(test)]
 mod test_overflow;
+#[cfg(test)]
+mod test_token;
