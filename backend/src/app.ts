@@ -19,6 +19,7 @@ import { codegenRouter } from "./api/routes/codegen.js";
 import { notificationsRouter } from "./api/routes/notifications.js";
 import { analyticsRouter } from "./api/routes/analytics.js";
 import { proxyRouter } from "./api/routes/proxy.js";
+import { featureFlagsRouter } from "./api/routes/featureFlags.js";
 import { errorHandler } from "./api/middleware/errors.js";
 import { requestId } from "./api/middleware/requestId.js";
 import { requestContext } from "./api/middleware/requestContext.js";
@@ -81,7 +82,7 @@ export function createApp(): Express {
   const origins = config.allowedOrigins;
   if (origins.length > 0) {
     const origin = origins.length === 1 && origins[0] === "*" ? "*" : origins;
-    app.use(cors({ 
+    app.use(cors({
       origin,
       maxAge: config.cors.maxAge,
     }));
@@ -119,6 +120,9 @@ export function createApp(): Express {
   app.use("/api/v1/analytics", publicLimiter, analyticsRouter);
   app.use("/api/v1/factory", publicLimiter, factoryRouter);
   app.use("/api/v1/admin/notifications", authLimiter, notificationsRouter);
+  // Feature flag admin endpoints — must be mounted before /api/v1/admin to
+  // avoid the admin auth middleware consuming /api/v1/admin/feature-flags (#916)
+  app.use("/api/v1/admin/feature-flags", authLimiter, featureFlagsRouter);
   app.use("/api/v1/admin", authLimiter, adminRouter);
   app.use("/api/v1/webhooks", authLimiter, webhooksRouter);
   // Request body dry run — validation only, never a side effect (#941)
